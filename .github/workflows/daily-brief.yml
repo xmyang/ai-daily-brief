@@ -1,0 +1,67 @@
+name: AI Daily Brief
+
+on:
+  schedule:
+    # 5:00am Melbourne AEST (UTC+10) = 19:00 UTC previous day
+    - cron: '0 19 * * *'
+  workflow_dispatch:  # allows manual trigger from GitHub UI
+
+jobs:
+  send-brief:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Restore seen URLs cache
+        uses: actions/cache@v4
+        with:
+          path: .seen_urls
+          key: seen-urls-${{ github.run_id }}
+          restore-keys: |
+            seen-urls-
+
+      - name: Create config from secrets
+        run: |
+          cat > brief_config.json << 'CONFIGEOF'
+          {
+            "smtp_user": "${{ secrets.SMTP_USER }}",
+            "smtp_password": "${{ secrets.SMTP_PASSWORD }}",
+            "claude_api_key": "${{ secrets.CLAUDE_API_KEY }}",
+            "recipients": ${{ secrets.RECIPIENTS }},
+            "days_lookback": 3,
+            "max_items_per_section": 4,
+            "podcast_rss": "https://aidailybrief.beehiiv.com/feed",
+            "linkedin": {
+              "page_slug": "make-ai-practical"
+            }
+          }
+          CONFIGEOF
+
+      - name: Run daily brief
+        run: python daily_brief.py
+
+      - name: Save seen URLs cache
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: .seen_urls
+          key: seen-urls-${{ github.run_id }}

@@ -1,0 +1,9 @@
+brief_config.json
+.last_sent
+.seen_urls
+*.png
+linkedin_session.json
+__pycache__/
+*.pyc
+brief.log
+daily_card_*.html
