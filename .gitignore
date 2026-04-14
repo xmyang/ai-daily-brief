@@ -7,3 +7,6 @@ __pycache__/
 *.pyc
 brief.log
 daily_card_*.html
+brief_config.json
+.last_sent
+.seen_urls
