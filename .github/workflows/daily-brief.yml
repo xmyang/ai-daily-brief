@@ -13,6 +13,17 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+      
+      - name: Debug - inspect workspace
+        run: |
+          echo "=== pwd ==="
+          pwd
+          echo "=== ls -la ==="
+          ls -la
+          echo "=== find daily_brief ==="
+          find . -iname "*daily_brief*" 2>/dev/null
+          echo "=== git status ==="
+          git log -1 --name-only
 
       - name: Set up Python
         uses: actions/setup-python@v5
