@@ -34,6 +34,52 @@ def load_config():
     with open(CONFIG_FILE) as f:
         return json.load(f)
 
+# ─── Tunable thresholds ───────────────────────────────────────────────────────
+# Freshness tiers — tune these to make the brief tighter or looser.
+FRESH_HOURS                  = 48   # items <= 48h old are "fresh"
+RECENT_DAYS                  = 7    # items 48h–7d old are "recent"; older is dropped
+FRESH_THRESHOLD              = 4    # if fewer fresh items than this, allow more recent
+MAX_RECENT_WHEN_FRESH_SHORT  = 5    # recent items shown when fresh < FRESH_THRESHOLD
+MAX_RECENT_WHEN_FRESH_OK     = 3    # recent items shown when fresh >= FRESH_THRESHOLD
+
+# Relevance scoring — weighted keywords matched against title+summary (lowercased).
+# Positive = boost, negative = penalty. Tune weights based on what shows up.
+RELEVANCE_KEYWORDS = {
+    # +3: core audience topics
+    "claude":              3,
+    "anthropic":           3,
+    "cowork":              3,
+    "agent skill":         3,
+    "practical ai":        3,
+    "ai adoption":         3,
+    # +2: adjacent professional topics
+    "ai coding":           2,
+    "vibe coding":         2,
+    "non-technical":       2,
+    "product management":  2,
+    "ai agents":           2,
+    # +1: lifestyle / community angles
+    "parenting":           1,
+    "future of work":      1,
+    "coaching":            1,
+    "chinese":             1,
+    "bilingual":           1,
+    # negative: low-signal finance noise
+    "stock price":        -2,
+    "market cap":         -2,
+    "layoffs":            -1,
+}
+MAX_SCORED_FOR_SUMMARY = 15   # only the top-N scored items get sent to Claude
+
+# High-signal RSS feeds — merged into a single "High-Signal Feeds" topic.
+HIGH_SIGNAL_FEEDS = [
+    ("Anthropic Blog",  "https://www.anthropic.com/news/rss.xml"),
+    ("Simon Willison",  "https://simonwillison.net/atom/everything/"),
+    ("Hacker News AI",  "https://hnrss.org/newest?q=AI&points=100"),
+    ("Ethan Mollick",   "https://www.oneusefulthing.org/feed"),
+    ("Latent Space",    "https://www.latent.space/feed"),
+]
+
 # ─── Sources ──────────────────────────────────────────────────────────────────
 
 PEOPLE = {
@@ -144,6 +190,14 @@ TOPICS = [
         "group": GROUP_WORK,
         "queries": ["AI future work jobs replaced augmented 2025", "AI workforce skills career adapt"]
     },
+    {
+        # Pooled items from HIGH_SIGNAL_FEEDS — no Google News queries for this topic.
+        "key": "high_signal",
+        "label": "High-Signal Feeds",
+        "icon": "🔥",
+        "group": GROUP_WORK,
+        "queries": []
+    },
     # ── Group: Daily Life ──
     {
         "key": "parenting_ai",
@@ -184,6 +238,73 @@ def _parse_date(date_str: str):
         except Exception:
             pass
     return None
+
+
+def _parse_item_date(item: dict):
+    """Parse an item's 'published' field. Try RFC 822 first, then ISO 8601. Return naive UTC datetime or None."""
+    raw = item.get("published", "") if isinstance(item, dict) else ""
+    if not raw:
+        return None
+    # RFC 822 (typical RSS)
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(raw)
+        if dt is not None:
+            return dt.replace(tzinfo=None)
+    except Exception:
+        pass
+    # ISO 8601 (typical Atom)
+    try:
+        iso = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+    except Exception:
+        pass
+    return None
+
+
+def categorise_by_freshness(items: list[dict]) -> tuple[list[dict], list[dict], int]:
+    """Split items into (fresh, recent, stale_count).
+    - fresh:  <= FRESH_HOURS old
+    - recent: between FRESH_HOURS and RECENT_DAYS old
+    - stale:  > RECENT_DAYS old (dropped, only count returned)
+    Items with no parseable date go to 'recent' so we don't silently lose them.
+    """
+    now = datetime.utcnow()
+    fresh_cutoff  = now - timedelta(hours=FRESH_HOURS)
+    recent_cutoff = now - timedelta(days=RECENT_DAYS)
+    fresh, recent, stale = [], [], 0
+    for it in items:
+        dt = _parse_item_date(it)
+        if dt is None:
+            recent.append(it)     # unknown date → keep in recent tier
+            continue
+        if dt >= fresh_cutoff:
+            fresh.append(it)
+        elif dt >= recent_cutoff:
+            recent.append(it)
+        else:
+            stale += 1
+    return fresh, recent, stale
+
+
+def pick_by_freshness(items: list[dict], label: str = "") -> list[dict]:
+    """Apply freshness rule: always show fresh; top-N recent depending on fresh count.
+    Logs dropped-stale count per source to help tune thresholds.
+    """
+    if not items:
+        return []
+    fresh, recent, stale = categorise_by_freshness(items)
+    if stale:
+        print(f"    [freshness] {label or 'items'}: {len(fresh)} fresh, {len(recent)} recent, dropped {stale} stale")
+    recent_cap = MAX_RECENT_WHEN_FRESH_SHORT if len(fresh) < FRESH_THRESHOLD else MAX_RECENT_WHEN_FRESH_OK
+    return fresh + recent[:recent_cap]
+
+
+def score_item(item: dict) -> int:
+    """Sum RELEVANCE_KEYWORDS matches on lowercased title + summary. Higher = more relevant."""
+    text = (item.get("title", "") + " " + item.get("summary", "")).lower()
+    return sum(weight for kw, weight in RELEVANCE_KEYWORDS.items() if kw in text)
 
 
 def fetch_google_news(query: str, max_items: int = 4, days: int = 3, seen_urls: set = None) -> list[dict]:
@@ -332,22 +453,44 @@ def build_takeaway_row(icon: str, label: str, item: dict) -> str:
     </div>"""
 
 
+# Audience profile for the Claude summariser. Depersonalised — safe to share externally.
+SUMMARY_SYSTEM_PROMPT = (
+    "You are writing for a reader who is a Technical PM at a design-software company, "
+    "an ACC-credentialed life coach, and founder of a community for Chinese-speaking "
+    "professionals in Australia focused on practical AI adoption. They care about: "
+    "practical AI adoption for non-technical users, the intersection of AI + coaching + "
+    "community, parenting in the AI era, and the future of work.\n\n"
+    "For each item, write:\n"
+    "- **What happened** (1 sentence, neutral)\n"
+    "- **Why it matters** (1 sentence tying to practical AI adoption, coaching, or a "
+    "Chinese-speaking professional community. If genuinely irrelevant, return 'skip' "
+    "and the item will be excluded.)\n"
+    "- **Share angle** (optional — only if obviously shareable on Xiaohongshu/WeChat, "
+    "phrased as a hook)\n\n"
+    "Tone: warm, precise, peer-to-peer — not expert-signalling."
+)
+
+
 def summarise_item(item: dict, context: str, api_key: str) -> str:
-    """Call Claude API to generate a one-line 'why it matters' summary."""
+    """Call Claude API with the audience-aware prompt.
+    Returns a multi-line summary string, or "" on error.
+    If Claude replies starting with 'skip', sets item['_skip'] = True for downstream filtering.
+    """
     if not api_key:
         return ""
     try:
         import urllib.request
-        prompt = (
-            f"Headline: {item['title']}\n"
-            f"Context: {context}\n\n"
-            "In ONE sentence (max 20 words), explain why this matters to a knowledge worker or parent. "
-            "Be specific and practical. No fluff. Do not start with 'This'."
+        user_msg = (
+            f"Headline: {item.get('title', '')}\n"
+            f"Source context: {context}\n"
+            f"Summary/excerpt: {item.get('summary', '')[:400]}\n\n"
+            "Respond in the 3-field format. Keep each field to one short sentence."
         )
         payload = json.dumps({
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 80,
-            "messages": [{"role": "user", "content": prompt}]
+            "max_tokens": 220,
+            "system": SUMMARY_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user_msg}]
         }).encode()
         req = urllib.request.Request(
             "https://api.anthropic.com/v1/messages",
@@ -358,59 +501,106 @@ def summarise_item(item: dict, context: str, api_key: str) -> str:
                 "content-type": "application/json"
             }
         )
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=12) as resp:
             data = json.loads(resp.read())
-            return data["content"][0]["text"].strip()
+            text = data["content"][0]["text"].strip()
+            if text.lower().lstrip("*_- ").startswith("skip"):
+                item["_skip"] = True
+                return ""
+            return text
     except Exception:
         return ""
 
 
 def fetch_all(config: dict) -> tuple:
-    """Fetch all news data. Returns (people_items, pod_items, topic_items)."""
+    """Fetch all news data. Returns (people_items, pod_items, topic_items).
+
+    Pipeline per source:
+      1. Fetch raw items (Google News / RSS).
+      2. Apply freshness filter via pick_by_freshness.
+    After all sources are fetched:
+      3. Score every item with score_item.
+      4. Keep only score > 0, take top MAX_SCORED_FOR_SUMMARY.
+      5. Call Claude summariser on that top set only (cost control).
+      6. Drop items Claude flagged as 'skip'.
+    """
     max_items = config.get("max_items_per_section", 4)
     seen      = load_seen_urls()
     api_key   = config.get("claude_api_key", "")
     if seen:
         print(f"  Skipping {len(seen)} URLs already shown in last brief.")
 
+    # ── 1-2. Fetch + freshness filter per person ──
     people_items = {}
     for name, meta in PEOPLE.items():
         print(f"  Fetching news for {name}…")
         items = []
-        # Try Google News first
         for q in meta["queries"][:1]:
             items = fetch_google_news(q, max_items, seen_urls=seen)
             if items:
                 break
-        # Fallback: direct RSS feeds
         if not items:
             for rss_url in meta.get("rss", []):
                 rss_items = fetch_rss(rss_url, max_items=max_items)
                 if rss_items:
                     items = rss_items
                     break
-        # Add summaries
-        if api_key and items:
-            for it in items[:2]:
-                it["summary"] = summarise_item(it, f"{name}, {meta['role']}", api_key)
-        people_items[name] = items
+        people_items[name] = pick_by_freshness(items, label=name)
 
+    # Podcast items are few and already curated — freshness filter would nuke them.
     print("  Fetching AI Daily Brief…")
     pod_items = fetch_rss(config.get("podcast_rss", "https://aidailybrief.beehiiv.com/feed"), max_items=3)
 
+    # ── 1-2. Fetch + freshness filter per topic ──
     topic_items = {}
     for topic in TOPICS:
+        # Skip the synthetic "high_signal" topic here — populated below from HIGH_SIGNAL_FEEDS.
+        if topic["key"] == "high_signal":
+            continue
         print(f"  Fetching topic: {topic['label']}…")
         items = []
         for q in topic["queries"][:1]:
             items = fetch_google_news(q, max_items, seen_urls=seen)
             if items:
                 break
-        # Add summaries
-        if api_key and items:
-            for it in items[:2]:
-                it["summary"] = summarise_item(it, topic["label"], api_key)
-        topic_items[topic["key"]] = items
+        topic_items[topic["key"]] = pick_by_freshness(items, label=topic["label"])
+
+    # ── High-signal RSS pool ──
+    print("  Fetching high-signal feeds…")
+    pooled = []
+    for src_name, url in HIGH_SIGNAL_FEEDS:
+        feed_items = fetch_rss(url, max_items=5)
+        for it in feed_items:
+            it.setdefault("source", src_name)
+            if it.get("link") and it["link"] not in seen:
+                pooled.append(it)
+    topic_items["high_signal"] = pick_by_freshness(pooled, label="High-Signal Feeds")[:max_items]
+
+    # ── 3-6. Relevance-gated Claude summaries ──
+    if api_key:
+        # Build a flat pool of (item, context) with scores.
+        scored: list[tuple[int, dict, str]] = []
+        for name, items in people_items.items():
+            role = PEOPLE[name]["role"]
+            for it in items:
+                scored.append((score_item(it), it, f"{name}, {role}"))
+        for topic in TOPICS:
+            for it in topic_items.get(topic["key"], []):
+                scored.append((score_item(it), it, topic["label"]))
+
+        # Filter score > 0, sort desc, cap at MAX_SCORED_FOR_SUMMARY.
+        relevant = [s for s in scored if s[0] > 0]
+        relevant.sort(key=lambda x: x[0], reverse=True)
+        relevant = relevant[:MAX_SCORED_FOR_SUMMARY]
+        print(f"  Scoring: {len(relevant)} of {len(scored)} items passed relevance gate (>0).")
+
+        for _score, it, ctx in relevant:
+            it["summary"] = summarise_item(it, ctx, api_key)
+
+        # Drop Claude-skipped items from all buckets.
+        def _keep(lst): return [it for it in lst if not it.get("_skip")]
+        people_items = {k: _keep(v) for k, v in people_items.items()}
+        topic_items  = {k: _keep(v) for k, v in topic_items.items()}
 
     return people_items, pod_items, topic_items
 

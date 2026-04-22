@@ -41,6 +41,31 @@
 
 ---
 
+## High-Signal AI Feeds
+
+Pooled under the 🔥 **High-Signal Feeds** section in the brief. All items pass the same freshness + relevance scoring as other sources.
+
+| Source | Feed |
+|--------|------|
+| **Anthropic Blog** | `https://www.anthropic.com/news/rss.xml` |
+| **Simon Willison** | `https://simonwillison.net/atom/everything/` |
+| **Hacker News (AI, 100+ points)** | `https://hnrss.org/newest?q=AI&points=100` |
+| **Ethan Mollick — One Useful Thing** | `https://www.oneusefulthing.org/feed` |
+| **Latent Space** | `https://www.latent.space/feed` |
+
+---
+
+## Freshness & Relevance Filters
+
+- **Fresh** (≤48h) — always shown.
+- **Recent** (48h–7d) — up to 5 if fresh <4 items, else up to 3.
+- **Stale** (>7d) — dropped, logged as a count.
+- **Relevance scoring** — items with score >0 (weighted keywords in `RELEVANCE_KEYWORDS`) are ranked and the top 15 get Claude-generated "why it matters" summaries.
+
+Tune thresholds in `daily_brief.py` under *Tunable thresholds*.
+
+---
+
 ## Setup Notes
 
 1. Clone this folder to your machine
